@@ -11,8 +11,7 @@ func GetEnvStr(key, defaultValue string) string {
 	if !ok {
 		return defaultValue
 	}
-	value := strings.TrimSpace(v)
-	return value
+	return strings.TrimSpace(v)
 }
 
 func GetEnvBool(key string, defaultValue bool) bool {
