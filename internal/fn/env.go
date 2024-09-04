@@ -12,9 +12,6 @@ func GetEnvStr(key, defaultValue string) string {
 		return defaultValue
 	}
 	value := strings.TrimSpace(v)
-	if value == "" {
-		return ""
-	}
 	return value
 }
 
