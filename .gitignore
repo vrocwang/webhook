@@ -1,11 +1,12 @@
 .idea
 .cover
 .DS_Store
+*.test
 coverage
 webhook
 /test/hookecho
 build
-coverage.out
 coverage.html
 config.json
 redeploy.sh
+*.out
