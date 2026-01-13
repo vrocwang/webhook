@@ -4,11 +4,12 @@
 package platform
 
 import (
-	"log"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/soulteary/webhook/internal/logger"
 	"github.com/soulteary/webhook/internal/pidfile"
 )
 
@@ -34,12 +35,22 @@ func NewSignalHandler(exitFunc ExitFunc) *SignalHandler {
 // SetupSignals sets up the signal handler and returns the created signal channel.
 // If the provided signals is nil, a new channel is created.
 func SetupSignals(signals chan os.Signal, reloadFn func(), pidFile *pidfile.PIDFile) chan os.Signal {
-	return SetupSignalsWithHandler(signals, reloadFn, pidFile, nil)
+	return SetupSignalsWithShutdown(signals, reloadFn, nil, pidFile, nil)
+}
+
+// SetupSignalsWithShutdown sets up the signal handler with support for shutdown callback.
+func SetupSignalsWithShutdown(signals chan os.Signal, reloadFn func(), shutdownFn func(), pidFile *pidfile.PIDFile, exitFunc ExitFunc) chan os.Signal {
+	return SetupSignalsWithHandlerAndShutdown(signals, reloadFn, shutdownFn, pidFile, exitFunc)
 }
 
 // SetupSignalsWithHandler sets up the signal handler with support for custom ExitFunc for testing.
 func SetupSignalsWithHandler(signals chan os.Signal, reloadFn func(), pidFile *pidfile.PIDFile, exitFunc ExitFunc) chan os.Signal {
-	log.Printf("setting up os signal watcher\n")
+	return SetupSignalsWithHandlerAndShutdown(signals, reloadFn, nil, pidFile, exitFunc)
+}
+
+// SetupSignalsWithHandlerAndShutdown sets up the signal handler with support for shutdown callback and custom ExitFunc.
+func SetupSignalsWithHandlerAndShutdown(signals chan os.Signal, reloadFn func(), shutdownFn func(), pidFile *pidfile.PIDFile, exitFunc ExitFunc) chan os.Signal {
+	logger.Infof("setting up os signal watcher")
 
 	if signals == nil {
 		signals = make(chan os.Signal, 1)
@@ -50,38 +61,40 @@ func SetupSignalsWithHandler(signals chan os.Signal, reloadFn func(), pidFile *p
 	signal.Notify(signals, os.Interrupt)
 
 	handler := NewSignalHandler(exitFunc)
-	go handler.watchForSignals(signals, reloadFn, pidFile)
+	go handler.watchForSignals(signals, reloadFn, shutdownFn, pidFile)
 
 	return signals
 }
 
 // watchForSignals listens for signals and handles them.
-func (h *SignalHandler) watchForSignals(signals chan os.Signal, reloadFn func(), pidFile *pidfile.PIDFile) {
-	log.Println("os signal watcher ready")
+func (h *SignalHandler) watchForSignals(signals chan os.Signal, reloadFn func(), shutdownFn func(), pidFile *pidfile.PIDFile) {
+	logger.Info("os signal watcher ready")
 
-	for {
-		sig := <-signals
+	for sig := range signals {
 		switch sig {
 		case syscall.SIGUSR1:
-			log.Println("caught USR1 signal")
+			logger.Info("caught USR1 signal")
 			reloadFn()
 
 		case syscall.SIGHUP:
-			log.Println("caught HUP signal")
+			logger.Info("caught HUP signal")
 			reloadFn()
 
 		case os.Interrupt, syscall.SIGTERM:
-			log.Printf("caught %s signal; exiting\n", sig)
+			logger.Infof("caught %s signal; shutting down gracefully", sig)
+			if shutdownFn != nil {
+				shutdownFn()
+			}
 			if pidFile != nil {
 				err := pidFile.Remove()
 				if err != nil {
-					log.Print(err)
+					logger.Error(fmt.Sprintf("%v", err))
 				}
 			}
 			h.exitFunc(0)
 
 		default:
-			log.Printf("caught unhandled signal %+v\n", sig)
+			logger.Warnf("caught unhandled signal %+v", sig)
 		}
 	}
 }

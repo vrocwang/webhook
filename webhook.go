@@ -1,15 +1,16 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"fmt"
-	"io"
-	"log"
 	"net"
 	"os"
+	"time"
 
 	"github.com/soulteary/webhook/internal/flags"
 	"github.com/soulteary/webhook/internal/i18n"
+	"github.com/soulteary/webhook/internal/logger"
 	"github.com/soulteary/webhook/internal/monitor"
 	"github.com/soulteary/webhook/internal/pidfile"
 	"github.com/soulteary/webhook/internal/platform"
@@ -19,8 +20,9 @@ import (
 )
 
 var (
-	signals chan os.Signal
-	pidFile *pidfile.PIDFile
+	signals    chan os.Signal
+	pidFile    *pidfile.PIDFile
+	httpServer *server.Server
 )
 
 //go:embed locales/*.toml
@@ -29,6 +31,30 @@ var WebhookLocales embed.FS
 func NeedEchoVersionInfo(appFlags flags.AppFlags) {
 	if appFlags.ShowVersion {
 		i18n.Println(i18n.MSG_WEBHOOK_VERSION, version.Version)
+		os.Exit(0)
+	}
+}
+
+func NeedValidateConfig(appFlags flags.AppFlags) {
+	if appFlags.ValidateConfig {
+		// 加锁检查和更新 HooksFiles（与 main 函数中的逻辑一致）
+		rules.LockHooksFiles()
+		if len(rules.HooksFiles) == 0 {
+			rules.HooksFiles = append(rules.HooksFiles, "hooks.json")
+		}
+		rules.UnlockHooksFiles()
+
+		// 验证配置
+		validationResult := flags.Validate(appFlags)
+		if validationResult.HasErrors() {
+			fmt.Fprintf(os.Stderr, "%s\n", i18n.Sprintf(i18n.MSG_CONFIG_VALIDATION_FAILED, len(validationResult.Errors)))
+			for _, err := range validationResult.Errors {
+				fmt.Fprintf(os.Stderr, "  - %s\n", err.Error())
+			}
+			os.Exit(1)
+		}
+
+		fmt.Println(i18n.Sprintf(i18n.MSG_CONFIG_VALIDATION_PASSED))
 		os.Exit(0)
 	}
 }
@@ -59,14 +85,14 @@ func DropPrivileges(appFlags flags.AppFlags, logQueue *[]string) {
 	}
 }
 
-func SetupLogger(appFlags flags.AppFlags, logQueue *[]string) (logFile *os.File, err error) {
-	if appFlags.LogPath != "" {
-		logFile, err = os.OpenFile(appFlags.LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-		if err != nil {
-			*logQueue = append(*logQueue, i18n.Sprintf(i18n.ERR_SERVER_OPENING_LOG_FILE, appFlags.LogPath, err))
-		}
+func SetupLogger(appFlags flags.AppFlags, logQueue *[]string) error {
+	// 初始化日志系统
+	err := logger.Init(appFlags.Verbose, appFlags.Debug, appFlags.LogPath, false)
+	if err != nil {
+		*logQueue = append(*logQueue, i18n.Sprintf(i18n.ERR_SERVER_OPENING_LOG_FILE, appFlags.LogPath, err))
+		return err
 	}
-	return logFile, err
+	return nil
 }
 
 func main() {
@@ -77,6 +103,8 @@ func main() {
 
 	// check if we need to echo version info and quit app
 	NeedEchoVersionInfo(appFlags)
+	// check if we need to validate config and quit app
+	NeedValidateConfig(appFlags)
 	// check if the privileges params are correct, or exit(1)
 	CheckPrivilegesParamsCorrect(appFlags)
 
@@ -84,8 +112,21 @@ func main() {
 		appFlags.Verbose = true
 	}
 
+	// 加锁检查和更新 HooksFiles
+	rules.LockHooksFiles()
 	if len(rules.HooksFiles) == 0 {
 		rules.HooksFiles = append(rules.HooksFiles, "hooks.json")
+	}
+	rules.UnlockHooksFiles()
+
+	// 验证配置
+	validationResult := flags.Validate(appFlags)
+	if validationResult.HasErrors() {
+		fmt.Fprintf(os.Stderr, "%s\n", i18n.Sprintf(i18n.MSG_CONFIG_VALIDATION_FAILED, len(validationResult.Errors)))
+		for _, err := range validationResult.Errors {
+			fmt.Fprintf(os.Stderr, "  - %s\n", err.Error())
+		}
+		os.Exit(1)
 	}
 
 	// logQueue is a queue for log messages encountered during startup. We need
@@ -98,22 +139,20 @@ func main() {
 	// drop privileges
 	DropPrivileges(appFlags, &logQueue)
 	// setup logger
-	logFile, err := SetupLogger(appFlags, &logQueue)
-	if err == nil && logFile != nil {
-		log.SetOutput(logFile)
-	}
-	log.SetPrefix("[webhook] ")
-	log.SetFlags(log.Ldate | log.Ltime)
-
-	if len(logQueue) != 0 {
+	err := SetupLogger(appFlags, &logQueue)
+	if err != nil {
+		// 如果日志初始化失败，使用标准输出输出错误信息
 		for i := range logQueue {
-			log.Println(logQueue[i])
+			fmt.Fprintln(os.Stderr, logQueue[i])
 		}
 		os.Exit(1)
 	}
 
-	if !appFlags.Verbose {
-		log.SetOutput(io.Discard)
+	if len(logQueue) != 0 {
+		for i := range logQueue {
+			logger.Error(logQueue[i])
+		}
+		os.Exit(1)
 	}
 
 	// Create pidfile
@@ -122,38 +161,53 @@ func main() {
 
 		pidFile, err = pidfile.New(appFlags.PidPath)
 		if err != nil {
-			log.Fatal(i18n.ERR_CREATING_PID_FILE, err)
+			logger.Fatalf("%s %v", i18n.ERR_CREATING_PID_FILE, err)
 		}
 
 		defer func() {
 			// NOTE(moorereason): my testing shows that this doesn't work with
 			// ^C, so we also do a Remove in the signal handler elsewhere.
 			if nerr := pidFile.Remove(); nerr != nil {
-				log.Print(nerr)
+				logger.Error(fmt.Sprintf("%v", nerr))
 			}
 		}()
 	}
 
-	log.Println(i18n.Sprintf(i18n.MSG_SERVER_IS_STARTING, version.Version))
-
-	// set os signal watcher
-	if appFlags.AsTemplate {
-		signals = platform.SetupSignals(signals, rules.ReloadAllHooksAsTemplate, pidFile)
-	} else {
-		signals = platform.SetupSignals(signals, rules.ReloadAllHooksNotAsTemplate, pidFile)
-	}
+	logger.Info(i18n.Sprintf(i18n.MSG_SERVER_IS_STARTING, version.Version))
 
 	// load and parse hooks
 	rules.ParseAndLoadHooks(appFlags.AsTemplate)
 
 	if !appFlags.Verbose && !appFlags.NoPanic && rules.LenLoadedHooks() == 0 {
-		log.SetOutput(os.Stdout)
-		log.Fatalln(i18n.Sprintf(i18n.ERR_COULD_NOT_LOAD_ANY_HOOKS))
+		logger.Fatalln(i18n.Sprintf(i18n.ERR_COULD_NOT_LOAD_ANY_HOOKS))
 	}
 
 	if appFlags.HotReload {
 		monitor.ApplyWatcher(appFlags)
 	}
 
-	server.Launch(appFlags, addr, *ln)
+	// 启动服务器
+	httpServer = server.Launch(appFlags, addr, *ln)
+
+	// 设置优雅关闭回调
+	shutdownFn := func() {
+		if httpServer != nil {
+			// 设置最大等待时间为 30 秒
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := httpServer.Shutdown(ctx); err != nil {
+				logger.Errorf("error during graceful shutdown: %v", err)
+			}
+		}
+	}
+
+	// set os signal watcher with shutdown callback
+	if appFlags.AsTemplate {
+		signals = platform.SetupSignalsWithShutdown(signals, rules.ReloadAllHooksAsTemplate, shutdownFn, pidFile, nil)
+	} else {
+		signals = platform.SetupSignalsWithShutdown(signals, rules.ReloadAllHooksNotAsTemplate, shutdownFn, pidFile, nil)
+	}
+
+	// 等待服务器关闭
+	select {}
 }

@@ -1,22 +1,35 @@
 package server
 
 import (
+	"context"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
-	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/soulteary/webhook/internal/flags"
 	"github.com/soulteary/webhook/internal/link"
+	"github.com/soulteary/webhook/internal/logger"
+	"github.com/soulteary/webhook/internal/metrics"
 	"github.com/soulteary/webhook/internal/middleware"
 )
 
-func Launch(appFlags flags.AppFlags, addr string, ln net.Listener) {
-	r := mux.NewRouter()
+// Server 管理 HTTP 服务器和优雅关闭
+type Server struct {
+	server   *http.Server
+	listener net.Listener
+	mu       sync.Mutex
+	shutdown bool
+}
+
+// Launch 启动 HTTP 服务器并返回 Server 实例
+func Launch(appFlags flags.AppFlags, addr string, ln net.Listener) *Server {
+	r := chi.NewRouter()
 
 	r.Use(middleware.RequestID(
 		middleware.UseXRequestIDHeaderOption(appFlags.UseXRequestID),
@@ -25,8 +38,22 @@ func Launch(appFlags flags.AppFlags, addr string, ln net.Listener) {
 	r.Use(middleware.NewLogger())
 	r.Use(chimiddleware.Recoverer)
 
+	// 添加限流中间件（如果启用）
+	if appFlags.RateLimitEnabled {
+		rateLimitConfig := middleware.RateLimitConfig{
+			Enabled: appFlags.RateLimitEnabled,
+			RPS:     appFlags.RateLimitRPS,
+			Burst:   appFlags.RateLimitBurst,
+		}
+		r.Use(middleware.NewRateLimitMiddleware(rateLimitConfig))
+		logger.Infof("rate limiting enabled: %d RPS, burst: %d", appFlags.RateLimitRPS, appFlags.RateLimitBurst)
+	}
+
 	if appFlags.Debug {
-		r.Use(middleware.Dumper(log.Writer()))
+		dumperConfig := middleware.DumperConfig{
+			IncludeRequestBody: appFlags.LogRequestBody,
+		}
+		r.Use(middleware.DumperWithConfig(logger.Writer(), dumperConfig))
 	}
 
 	// Clean up input
@@ -34,26 +61,138 @@ func Launch(appFlags flags.AppFlags, addr string, ln net.Listener) {
 
 	hooksURL := link.MakeRoutePattern(&appFlags.HooksURLPrefix)
 
-	r.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		for _, responseHeader := range appFlags.ResponseHeaders {
-			w.Header().Set(responseHeader.Name, responseHeader.Value)
-		}
+	// 健康检查端点
+	r.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
+		startTime := time.Now()
+		defer func() {
+			duration := time.Since(startTime)
+			metrics.RecordHTTPRequest(req.Method, "200", "/health", duration)
+		}()
 
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"status":"ok"}`)
+	})
+
+	// Prometheus metrics 端点
+	r.Handle("/metrics", promhttp.Handler())
+
+	// 根路径
+	r.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
+		startTime := time.Now()
+		defer func() {
+			duration := time.Since(startTime)
+			metrics.RecordHTTPRequest(req.Method, "200", "/", duration)
+		}()
+
+		setResponseHeaders(w, appFlags.ResponseHeaders)
 		fmt.Fprint(w, "OK")
 	})
 
-	hookHandler := createHookHandler(appFlags)
-	r.HandleFunc(hooksURL, hookHandler)
-
 	// Create common HTTP server settings
+	// 使用配置的超时参数（支持通过命令行参数或环境变量覆盖）
+	// 如果未配置，envs.go 中已设置默认值
+	readHeaderTimeout := time.Duration(appFlags.ReadHeaderTimeoutSeconds) * time.Second
+	if readHeaderTimeout == 0 {
+		readHeaderTimeout = 5 * time.Second // 额外保护，防止为 0
+	}
+	readTimeout := time.Duration(appFlags.ReadTimeoutSeconds) * time.Second
+	if readTimeout == 0 {
+		readTimeout = 10 * time.Second
+	}
+	writeTimeout := time.Duration(appFlags.WriteTimeoutSeconds) * time.Second
+	if writeTimeout == 0 {
+		writeTimeout = 30 * time.Second
+	}
+	idleTimeout := time.Duration(appFlags.IdleTimeoutSeconds) * time.Second
+	if idleTimeout == 0 {
+		idleTimeout = 90 * time.Second
+	}
+	maxHeaderBytes := appFlags.MaxHeaderBytes
+	if maxHeaderBytes == 0 {
+		maxHeaderBytes = 1 << 20 // 1MB
+	}
+
 	svr := &http.Server{
 		Addr:              addr,
 		Handler:           r,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       5 * time.Second,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
 	}
 
-	// Serve HTTP
-	log.Printf("serving hooks on http://%s%s", addr, link.MakeHumanPattern(&appFlags.HooksURLPrefix))
-	log.Print(svr.Serve(ln))
+	s := &Server{
+		server:   svr,
+		listener: ln,
+	}
+
+	hookHandler := createHookHandler(appFlags, s)
+	// Register both /{id} and /{id}/* routes to support:
+	// - Simple hook IDs: /hooks/github
+	// - Hook IDs with slashes: /hooks/sendgrid/dir
+	r.HandleFunc(hooksURL, hookHandler)
+	r.HandleFunc(hooksURL+"/*", hookHandler)
+
+	// 启动系统指标收集器（每 10 秒更新一次）
+	metrics.StartSystemMetricsCollector(10 * time.Second)
+
+	// Serve HTTP in a goroutine
+	go func() {
+		logger.Infof("serving hooks on http://%s%s", addr, link.MakeHumanPattern(&appFlags.HooksURLPrefix))
+		logger.Infof("health check endpoint: http://%s/health", addr)
+		logger.Infof("metrics endpoint: http://%s/metrics", addr)
+		if err := svr.Serve(ln); err != nil && err != http.ErrServerClosed {
+			logger.Error(fmt.Sprintf("server error: %v", err))
+		}
+	}()
+
+	return s
+}
+
+// Shutdown 优雅关闭服务器
+// 1. 停止接受新请求
+// 2. 等待正在执行的 hook 完成
+// 3. 设置最大等待时间
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	if s.shutdown {
+		s.mu.Unlock()
+		return nil
+	}
+	s.shutdown = true
+	s.mu.Unlock()
+
+	// 停止接受新请求
+	s.server.SetKeepAlivesEnabled(false)
+
+	// 等待正在执行的 hook 完成
+	done := make(chan error, 1)
+	go func() {
+		// 等待所有异步执行的 hook goroutine 完成
+		GetAsyncHookWaitGroup().Wait()
+		// 关闭 HTTP 服务器
+		done <- s.server.Shutdown(ctx)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			logger.Errorf("error during server shutdown: %v", err)
+		} else {
+			logger.Info("server shutdown completed gracefully")
+		}
+		return err
+	case <-ctx.Done():
+		logger.Warnf("server shutdown timeout: %v", ctx.Err())
+		return ctx.Err()
+	}
+}
+
+// IsShuttingDown 检查服务器是否正在关闭
+func (s *Server) IsShuttingDown() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.shutdown
 }

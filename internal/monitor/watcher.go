@@ -1,10 +1,9 @@
 package monitor
 
 import (
-	"log"
-
 	"github.com/fsnotify/fsnotify"
 	"github.com/soulteary/webhook/internal/flags"
+	"github.com/soulteary/webhook/internal/logger"
 	"github.com/soulteary/webhook/internal/rules"
 )
 
@@ -14,17 +13,23 @@ func ApplyWatcher(appFlags flags.AppFlags) {
 	var err error
 	watcher, err = fsnotify.NewWatcher()
 	if err != nil {
-		log.Fatal("error creating file watcher instance\n", err)
+		logger.Fatalf("error creating file watcher instance: %v", err)
 	}
 	defer watcher.Close()
 
-	for _, hooksFilePath := range rules.HooksFiles {
+	// 加锁读取 HooksFiles
+	rules.RLockHooksFiles()
+	hooksFilesCopy := make([]string, len(rules.HooksFiles))
+	copy(hooksFilesCopy, rules.HooksFiles)
+	rules.RUnlockHooksFiles()
+
+	for _, hooksFilePath := range hooksFilesCopy {
 		// set up file watcher
-		log.Printf("setting up file watcher for %s\n", hooksFilePath)
+		logger.Infof("setting up file watcher for %s", hooksFilePath)
 
 		err = watcher.Add(hooksFilePath)
 		if err != nil {
-			log.Print("error adding hooks file to the watcher\n", err)
+			logger.Errorf("error adding hooks file %s to the watcher: %v", hooksFilePath, err)
 			return
 		}
 	}

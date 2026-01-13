@@ -22,6 +22,7 @@ func ParseEnvs() AppFlags {
 	flags.UseXRequestID = fn.GetEnvBool(ENV_KEY_X_REQUEST_ID, DEFAULT_ENABLE_X_REQUEST_ID)
 	flags.XRequestIDLimit = fn.GetEnvInt(ENV_KEY_X_REQUEST_ID, DEFAULT_X_REQUEST_ID_LIMIT)
 	flags.MaxMultipartMem = int64(fn.GetEnvInt(ENV_KEY_MAX_MPART_MEM, DEFAULT_MAX_MPART_MEM))
+	flags.MaxRequestBodySize = int64(fn.GetEnvInt(ENV_KEY_MAX_REQUEST_BODY_SIZE, DEFAULT_MAX_REQUEST_BODY_SIZE))
 	flags.SetGID = fn.GetEnvInt(ENV_KEY_GID, DEFAULT_GID)
 	flags.SetUID = fn.GetEnvInt(ENV_KEY_UID, DEFAULT_UID)
 	flags.HttpMethods = fn.GetEnvStr(ENV_KEY_HTTP_METHODS, DEFAULT_HTTP_METHODS)
@@ -30,6 +31,34 @@ func ParseEnvs() AppFlags {
 	// init i18n, set lang and i18n dir
 	flags.Lang = fn.GetEnvStr(ENV_KEY_LANG, DEFAULT_LANG)
 	flags.I18nDir = fn.GetEnvStr(ENV_KEY_I18N, DEFAULT_I18N_DIR)
+
+	// hook execution configuration
+	flags.HookTimeoutSeconds = fn.GetEnvInt(ENV_KEY_HOOK_TIMEOUT_SECONDS, DEFAULT_HOOK_TIMEOUT_SECONDS)
+	flags.MaxConcurrentHooks = fn.GetEnvInt(ENV_KEY_MAX_CONCURRENT_HOOKS, DEFAULT_MAX_CONCURRENT_HOOKS)
+	flags.HookExecutionTimeout = fn.GetEnvInt(ENV_KEY_HOOK_EXECUTION_TIMEOUT, DEFAULT_HOOK_EXECUTION_TIMEOUT)
+	flags.AllowAutoChmod = fn.GetEnvBool(ENV_KEY_ALLOW_AUTO_CHMOD, DEFAULT_ALLOW_AUTO_CHMOD)
+
+	// Security settings
+	flags.AllowedCommandPaths = fn.GetEnvStr(ENV_KEY_ALLOWED_COMMAND_PATHS, DEFAULT_ALLOWED_COMMAND_PATHS)
+	flags.MaxArgLength = fn.GetEnvInt(ENV_KEY_MAX_ARG_LENGTH, DEFAULT_MAX_ARG_LENGTH)
+	flags.MaxTotalArgsLength = fn.GetEnvInt(ENV_KEY_MAX_TOTAL_ARGS_LENGTH, DEFAULT_MAX_TOTAL_ARGS_LENGTH)
+	flags.MaxArgsCount = fn.GetEnvInt(ENV_KEY_MAX_ARGS_COUNT, DEFAULT_MAX_ARGS_COUNT)
+	flags.StrictMode = fn.GetEnvBool(ENV_KEY_STRICT_MODE, DEFAULT_STRICT_MODE)
+
+	// Rate limiting settings
+	flags.RateLimitEnabled = fn.GetEnvBool(ENV_KEY_RATE_LIMIT_ENABLED, DEFAULT_RATE_LIMIT_ENABLED)
+	flags.RateLimitRPS = fn.GetEnvInt(ENV_KEY_RATE_LIMIT_RPS, DEFAULT_RATE_LIMIT_RPS)
+	flags.RateLimitBurst = fn.GetEnvInt(ENV_KEY_RATE_LIMIT_BURST, DEFAULT_RATE_LIMIT_BURST)
+
+	// Logging settings
+	flags.LogRequestBody = fn.GetEnvBool(ENV_KEY_LOG_REQUEST_BODY, DEFAULT_LOG_REQUEST_BODY)
+
+	// HTTP server timeout settings
+	flags.ReadHeaderTimeoutSeconds = fn.GetEnvInt(ENV_KEY_READ_HEADER_TIMEOUT_SECONDS, DEFAULT_READ_HEADER_TIMEOUT_SECONDS)
+	flags.ReadTimeoutSeconds = fn.GetEnvInt(ENV_KEY_READ_TIMEOUT_SECONDS, DEFAULT_READ_TIMEOUT_SECONDS)
+	flags.WriteTimeoutSeconds = fn.GetEnvInt(ENV_KEY_WRITE_TIMEOUT_SECONDS, DEFAULT_WRITE_TIMEOUT_SECONDS)
+	flags.IdleTimeoutSeconds = fn.GetEnvInt(ENV_KEY_IDLE_TIMEOUT_SECONDS, DEFAULT_IDLE_TIMEOUT_SECONDS)
+	flags.MaxHeaderBytes = fn.GetEnvInt(ENV_KEY_MAX_HEADER_BYTES, DEFAULT_MAX_HEADER_BYTES)
 
 	hooks := strings.Split(fn.GetEnvStr(ENV_KEY_HOOKS, ""), ",")
 	var hooksFiles hook.HooksFiles

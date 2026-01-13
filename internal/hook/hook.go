@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"path/filepath"
+	"sync"
 
 	// #nosec
 	"crypto/sha1"
@@ -15,8 +16,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/soulteary/webhook/internal/logger"
 	"hash"
-	"log"
 	"math"
 	"net"
 	"net/textproto"
@@ -433,13 +434,26 @@ func GetParameter(s string, params interface{}) (interface{}, error) {
 
 		// Check for dotted references
 		p := strings.Split(s, ".")
+		var refBuilder strings.Builder
 		for i := range p {
-			ref := strings.Join(p[:i+1], ".")
+			if i > 0 {
+				refBuilder.WriteByte('.')
+			}
+			refBuilder.WriteString(p[i])
+			ref := refBuilder.String()
 			if pValue, ok := params.(map[string]interface{})[ref]; ok {
 				if i == len(p)-1 {
 					return pValue, nil
 				}
-				return GetParameter(strings.Join(p[i+1:], "."), pValue)
+				// Build remaining path for recursive call
+				var remainingBuilder strings.Builder
+				for j := i + 1; j < len(p); j++ {
+					if j > i+1 {
+						remainingBuilder.WriteByte('.')
+					}
+					remainingBuilder.WriteString(p[j])
+				}
+				return GetParameter(remainingBuilder.String(), pValue)
 			}
 		}
 	}
@@ -739,7 +753,7 @@ func (h *Hook) ExtractCommandArgumentsForFile(r *Request) ([]FileParameter, []er
 		envName := h.PassFileToCommand[i].EnvName
 		if envName == "" {
 			envName = EnvNamespace + strings.ToUpper(h.PassFileToCommand[i].Name)
-			log.Printf("no ENVVAR name specified, falling back to [%s]", envName)
+			logger.Warnf("no ENVVAR name specified, falling back to [%s]", envName)
 			h.PassFileToCommand[i].EnvName = envName
 		}
 
@@ -747,8 +761,8 @@ func (h *Hook) ExtractCommandArgumentsForFile(r *Request) ([]FileParameter, []er
 		if h.PassFileToCommand[i].Base64Decode {
 			dec, err := base64.StdEncoding.DecodeString(arg)
 			if err != nil {
-				log.Printf("error decoding string [%s]", err)
-				errs = append(errs, fmt.Errorf("base64 decode error: %w", err))
+				logger.Errorf("error decoding base64 string for hook %s (parameter: %s, arg_length: %d): %v", h.ID, h.PassFileToCommand[i].Name, len(arg), err)
+				errs = append(errs, fmt.Errorf("base64 decode error for parameter %s: %w", h.PassFileToCommand[i].Name, err))
 				continue
 			}
 			fileContent = dec
@@ -798,7 +812,64 @@ func (h *Hooks) LoadFromFile(path string, asTemplate bool) error {
 		file = buf.Bytes()
 	}
 
-	return yaml.Unmarshal(file, h)
+	err := yaml.Unmarshal(file, h)
+	if err != nil {
+		return err
+	}
+
+	// 清理和验证所有 hook 的 HTTP 方法
+	for i := range *h {
+		(*h)[i].SanitizeHTTPMethods()
+	}
+
+	return nil
+}
+
+// SanitizeHTTPMethods 清理和验证 HTTP 方法，移除空白字符并转换为大写
+// 同时移除重复的方法和无效的方法
+func (h *Hook) SanitizeHTTPMethods() {
+	if len(h.HTTPMethods) == 0 {
+		return
+	}
+
+	// 有效的 HTTP 方法列表
+	validMethods := map[string]bool{
+		"GET":     true,
+		"POST":    true,
+		"PUT":     true,
+		"PATCH":   true,
+		"DELETE":  true,
+		"HEAD":    true,
+		"OPTIONS": true,
+		"CONNECT": true,
+		"TRACE":   true,
+	}
+
+	// 使用 map 去重并清理
+	seen := make(map[string]bool)
+	sanitized := make([]string, 0, len(h.HTTPMethods))
+
+	for _, method := range h.HTTPMethods {
+		// 清理：去除空白字符并转换为大写
+		cleaned := strings.ToUpper(strings.TrimSpace(method))
+		if cleaned == "" {
+			continue
+		}
+
+		// 验证方法是否有效
+		if !validMethods[cleaned] {
+			logger.Warnf("invalid HTTP method '%s' for hook %s, ignoring", method, h.ID)
+			continue
+		}
+
+		// 去重
+		if !seen[cleaned] {
+			seen[cleaned] = true
+			sanitized = append(sanitized, cleaned)
+		}
+	}
+
+	h.HTTPMethods = sanitized
 }
 
 // Append appends hooks unless the new hooks contain a hook with an ID that already exists
@@ -908,6 +979,31 @@ func (r NotRule) Evaluate(req *Request) (bool, error) {
 	return !rv, err
 }
 
+// regexCache 缓存编译后的正则表达式，避免重复编译
+var regexCache sync.Map // map[string]*regexp.Regexp
+
+// getCompiledRegex 获取或编译正则表达式，使用缓存提高性能
+func getCompiledRegex(pattern string) (*regexp.Regexp, error) {
+	if pattern == "" {
+		return nil, errors.New("empty regex pattern")
+	}
+
+	// 尝试从缓存获取
+	if cached, ok := regexCache.Load(pattern); ok {
+		return cached.(*regexp.Regexp), nil
+	}
+
+	// 编译正则表达式
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+
+	// 存储到缓存
+	regexCache.Store(pattern, re)
+	return re, nil
+}
+
 // MatchRule will evaluate to true based on the type
 type MatchRule struct {
 	Type      string   `json:"type,omitempty"`
@@ -951,21 +1047,25 @@ func (r MatchRule) Evaluate(req *Request) (bool, error) {
 		case MatchValue:
 			return compare(arg, r.Value), nil
 		case MatchRegex:
-			return regexp.MatchString(r.Regex, arg)
+			re, err := getCompiledRegex(r.Regex)
+			if err != nil {
+				return false, err
+			}
+			return re.MatchString(arg), nil
 		case MatchHashSHA1:
-			log.Print(`warn: use of deprecated option payload-hash-sha1; use payload-hmac-sha1 instead`)
+			logger.Warn(`warn: use of deprecated option payload-hash-sha1; use payload-hmac-sha1 instead`)
 			fallthrough
 		case MatchHMACSHA1:
 			_, err := CheckPayloadSignature(req.Body, r.Secret, arg)
 			return err == nil, err
 		case MatchHashSHA256:
-			log.Print(`warn: use of deprecated option payload-hash-sha256: use payload-hmac-sha256 instead`)
+			logger.Warn(`warn: use of deprecated option payload-hash-sha256: use payload-hmac-sha256 instead`)
 			fallthrough
 		case MatchHMACSHA256:
 			_, err := CheckPayloadSignature256(req.Body, r.Secret, arg)
 			return err == nil, err
 		case MatchHashSHA512:
-			log.Print(`warn: use of deprecated option payload-hash-sha512: use payload-hmac-sha512 instead`)
+			logger.Warn(`warn: use of deprecated option payload-hash-sha512: use payload-hmac-sha512 instead`)
 			fallthrough
 		case MatchHMACSHA512:
 			_, err := CheckPayloadSignature512(req.Body, r.Secret, arg)
